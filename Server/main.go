@@ -4,16 +4,18 @@ import (
 	"log"      // Для вывода логов в консоль
 	"net/http" // Для запуска HTTP-сервера и обработки запросов
 	"sync"     // Для использования мьютекса
+	"time"
 
 	"github.com/gorilla/websocket" // Библиотека для работы с WebSocket-соединениями
 )
 
 // Packet — это структура, описывающая сообщение между клиентом и сервером
 type Packet struct {
-	Type  string   `json:"type"`            // Тип пакета: "msg" — сообщение, "users" — список пользователей
-	From  string   `json:"from,omitempty"`  // Отправитель (сервер подставляет сам при получении сообщения)
-	To    string   `json:"to"`              // Получатель (обязательное поле для отправки сообщения)
-	Text  string   `json:"text,omitempty"`  // Текст сообщения (используется только при Type == "msg")
+	Type  string   `json:"type"`           // Тип пакета: "msg" — сообщение, "users" — список пользователей
+	From  string   `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
+	To    string   `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
+	Text  string   `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
+	Ts    int64    `json:"ts,omitempty"`
 	Users []string `json:"users,omitempty"` // Список всех онлайн-пользователей (используется только при Type == "users")
 }
 
@@ -95,7 +97,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 
 		// Обрабатываем только личные сообщения
 		if p.Type == "msg" && p.To != "" && p.To != user {
-			p.From = user  // выставляем имя отправителя
+			p.From = user // выставляем имя отправителя
+			p.Ts = time.Now().UnixMilli()
 			broadcast <- p // передаём сообщение в канал для пересылки
 		}
 	}
