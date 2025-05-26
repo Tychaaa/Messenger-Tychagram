@@ -41,6 +41,10 @@ var (
 )
 
 func main() {
+	// Инициализируем БД
+	InitDB()
+	defer CloseDB()
+
 	// Устанавливаем обработчик для WebSocket-подключений по адресу /ws
 	http.HandleFunc("/ws", handleWS)
 
