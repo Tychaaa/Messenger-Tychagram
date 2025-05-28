@@ -1,16 +1,17 @@
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
+from collections    import defaultdict
+from datetime       import datetime, timezone
 
-from PyQt5.QtCore    import Qt
 from PyQt5.QtWidgets import (
     QWidget, QListWidget, QListWidgetItem, QLabel, QLineEdit, QPushButton,
-    QHBoxLayout, QVBoxLayout, QSplitter
+    QHBoxLayout, QVBoxLayout, QSplitter, QListView
 )
 
-from constants import PASTEL_QSS
+from constants  import PASTEL_QSS
+from models     import ChatListModel, ChatSummary
 from ws         import WSBridge
-from widgets    import BubbleWidget
+from widgets    import BubbleWidget, ChatItemDelegate
+
 
 # Главное окно мессенджера
 class ChatWindow(QWidget):
@@ -25,10 +26,16 @@ class ChatWindow(QWidget):
         self.resize(900, 600)
 
         # Список пользователей слева
-        self.usersList = QListWidget()
-        self.usersList.itemClicked.connect(
-            lambda item: self.switch_chat(item.text())
+        self.chatModel = ChatListModel(self)
+        self.chatListView = QListView()
+        self.chatListView.setModel(self.chatModel)
+        self.chatListView.setItemDelegate(ChatItemDelegate(self.chatListView))
+        self.chatListView.setSpacing(2)  # небольшие промежутки между карточками
+        self.chatListView.setVerticalScrollMode(QListView.ScrollPerPixel)
+        self.chatListView.setStyleSheet(
+            "QListView{background:transparent;border:none;}"
         )
+        self.chatListView.clicked.connect(self.on_chat_selected)
 
         # Список сообщений справа
         self.messages = QListWidget()
@@ -61,7 +68,7 @@ class ChatWindow(QWidget):
 
         # Основной делитель экрана: слева список пользователей, справа чат
         splitter = QSplitter()
-        splitter.addWidget(self.usersList)
+        splitter.addWidget(self.chatListView)
         splitter.addWidget(rightBox)
         splitter.setStretchFactor(1, 1)
 
@@ -78,26 +85,14 @@ class ChatWindow(QWidget):
 
     # Вызывается при выборе пользователя в списке.
     # Обновляет заголовок чата, активирует поле ввода и загружает историю переписки.
-    def switch_chat(self, text: str):
-        # Если строка пустая (ничего не выбрано) — ничего не делаем
-        if not text:
-            return
-
-        # Извлекаем имя пользователя (без индикатора ●)
-        self.recipient = text.split()[0]
-        # Отображаем имя выбранного собеседника над чат-окном
-        self.chatLabel.setText(self.recipient)
-        # Разблокируем кнопку "Send", теперь можно отправлять сообщения
+    def on_chat_selected(self, index):
+        """Обработка клика по диалогу в списке"""
+        username = self.chatModel.data(index, ChatListModel.UsernameRole)
+        self.recipient = username
+        display  = self.chatModel.data(index, ChatListModel.DisplayRole)
+        self.chatLabel.setText(display)
         self.sendBtn.setEnabled(True)
-        # Загружаем историю переписки с этим пользователем
         self.reload_chat_view()
-
-        # Убираем зелёную точку "непрочитано" у выбранного пользователя
-        for i in range(self.usersList.count()):
-            itm = self.usersList.item(i)
-            if itm.text().split()[0] == self.recipient:
-                itm.setText(self.recipient)
-                break
 
     # Отправляет сообщение выбранному собеседнику через WebSocket
     def send(self):
@@ -137,8 +132,22 @@ class ChatWindow(QWidget):
             return
 
         # Если это пакет со списком пользователей — обновляем список слева
-        if ptype == "users":
-            self.update_users(pkt["users"])
+        if ptype == "chats":
+            raw = pkt.get("chats", [])
+            chats = []
+            for c in raw:
+                chats.append(
+                    ChatSummary(
+                        chat_id = c["chat_id"],
+                        username = c["username"],
+                        display = c["display"],
+                        last_msg = c["last_msg"],
+                        last_at = c["last_at"],
+                    )
+                )
+            # сортировка по последнему сообщению (DESC)
+            chats.sort(key=lambda x: x.last_at, reverse=True)
+            self.chatModel.update_chats(chats)
             return
 
         # Если это сообщение — добавляем его в переписку
@@ -156,18 +165,11 @@ class ChatWindow(QWidget):
             # Если сейчас открыт чат с этим пользователем — сразу отображаем сообщение
             if peer == self.recipient:
                 self.add_bubble(pkt["from"], pkt["text"], time_now)
-            else:
-                # Иначе — помечаем, что есть непрочитанное сообщение
-                self.highlight_user(peer)
 
     # Рендер пузырька в messages-листе
     def add_bubble(self, sender: str, text: str, time_str: str):
         outgoing = sender == self.username                  # Проверяем, наше ли это сообщение
         bubble = BubbleWidget(text, outgoing, time_str)     # Создаём виджет-пузырёк
-
-        max_w = int(self.messages.viewport().width() * 0.9)
-        bubble.setMaximumWidth(max_w)
-        bubble.adjustSize()
 
         # Создаём элемент списка, к которому прикрепим наш пузырёк
         item = QListWidgetItem()
@@ -179,41 +181,9 @@ class ChatWindow(QWidget):
         # Автоматическая прокрутка вниз — чтобы было видно новое сообщение
         self.messages.scrollToBottom()
 
-    # Обновляет список онлайн-пользователей
-    def update_users(self, users):
-        # Сохраняем имя текущего выбранного собеседника (если он был)
-        cur_item = self.usersList.currentItem()
-        current = cur_item.text() if cur_item else ""
-
-        # Очищаем список и добавляем только других пользователей (без самого себя)
-        self.usersList.clear()
-        for u in sorted(users):
-            if u != self.username:
-                self.usersList.addItem(u)
-
-        # Если текущий собеседник всё ещё онлайн — восстанавливаем выделение
-        items = self.usersList.findItems(current, Qt.MatchExactly)
-        self.usersList.setCurrentItem(items[0] if items else None)
-
-        # Если выбранного собеседника больше нет в списке
-        if not items:
-            self.recipient = ""
-            self.chatLabel.setText("Выберите собеседника в списке слева")
-            self.messages.clear()
-            self.sendBtn.setEnabled(False)
-
     # Загружает переписку с выбранным пользователем
     def reload_chat_view(self):
         self.messages.clear()   # Очищаем текущее окно чата
         # Для каждого сообщения в истории текущего собеседника
         for frm, txt, tm in self.convs[self.recipient]:
             self.add_bubble(frm, txt, tm)   # Добавляем пузырёк в интерфейс
-
-    # Помечает пользователя в списке, у которого есть новое непрочитанное сообщение
-    def highlight_user(self, user):
-        for i in range(self.usersList.count()):
-            itm = self.usersList.item(i)
-            # Сравниваем имена без символов
-            if itm.text().split()[0] == user and not itm.text().endswith(" ●"):
-                itm.setText(f"{user} ●")      # зелёная точка «непрочитано»
-                break

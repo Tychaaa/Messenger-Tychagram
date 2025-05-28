@@ -1,5 +1,10 @@
+from datetime import datetime
+
+from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtCore    import Qt, QSize
 from PyQt5.QtWidgets import QWidget, QLabel, QFrame, QVBoxLayout, QHBoxLayout
+
+from models import ChatListModel
 
 # Виджет одного сообщения (пузырёк)
 class BubbleWidget(QWidget):
@@ -48,3 +53,78 @@ class BubbleWidget(QWidget):
     def sizeHint(self):
         # Получаем рекомендуемый размер от текущего layout-а
         return self.layout().sizeHint() + QSize(0, 20)
+
+class ChatItemDelegate(QtWidgets.QStyledItemDelegate):
+    _MARGIN   = 6
+    _RADIUS   = 6
+    _HEIGHT   = 64
+
+    def paint(self, painter, option, index):
+        painter.save()
+
+        # фон карточки
+        r = option.rect.adjusted(self._MARGIN, self._MARGIN,
+                                 -self._MARGIN, -self._MARGIN)
+        if option.state & QtWidgets.QStyle.State_Selected:
+            bg = QtGui.QColor("#d0e8ff")
+        elif option.state & QtWidgets.QStyle.State_MouseOver:
+            bg = QtGui.QColor("#eef5ff")
+        else:
+            bg = QtGui.QColor("#f7f7f7")
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(r, self._RADIUS, self._RADIUS)
+
+        # данные
+        display = index.data(ChatListModel.DisplayRole)
+        lastmsg = index.data(ChatListModel.LastMsgRole) or ""
+        last_at = index.data(ChatListModel.LastAtRole) or 0
+
+        # прямоугольник для текстов
+        inner = r.adjusted(10, 8, -10, -8)
+
+        # 1) Имя слева, время справа
+        # — имя
+        font = painter.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#000000"))
+        fm_name = QtGui.QFontMetrics(font)
+        name_h = fm_name.height()
+        painter.drawText(inner.x(), inner.y(),
+                         inner.width(), name_h,
+                         QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter,
+                         display)
+
+        # — время
+        ts = datetime.fromtimestamp(last_at/1000)
+        timestr = ts.strftime("%H:%M")
+        font.setPointSize(10)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#888888"))
+        painter.drawText(inner.x(), inner.y(),
+                         inner.width(), name_h,
+                         QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter,
+                         timestr)
+
+        # 2) Сообщение под именем
+        font.setPointSize(10)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#444444"))
+        fm_msg = QtGui.QFontMetrics(font)
+        # обрезаем, если не влезает
+        msg = fm_msg.elidedText(lastmsg, QtCore.Qt.ElideRight, inner.width())
+        painter.drawText(inner.x(),
+                         inner.y() + name_h + 4,
+                         inner.width(),
+                         fm_msg.height(),
+                         QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter,
+                         msg)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QtCore.QSize(option.rect.width(), self._HEIGHT) + QSize(0, 5)
