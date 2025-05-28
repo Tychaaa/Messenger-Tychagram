@@ -182,3 +182,67 @@ func sendHistory(username string, ws *websocket.Conn) {
 		})
 	}
 }
+
+// ChatSummary описывает одну запись в списке чатов
+type ChatSummary struct {
+	ChatID   int64  `json:"chat_id"`
+	Username string `json:"username"`
+	Display  string `json:"display"`
+	LastMsg  string `json:"last_msg"`
+	LastAt   int64  `json:"last_at"` // Unix ms
+}
+
+// GetUserChats возвращает список личных чатов пользователя с последним сообщением
+func GetUserChats(ctx context.Context, username string) ([]ChatSummary, error) {
+	// находим ID пользователя
+	var uid int64
+	if err := Pool.QueryRow(ctx,
+		`SELECT id FROM users WHERE username=$1`, username,
+	).Scan(&uid); err != nil {
+		return nil, fmt.Errorf("getUserID: %w", err)
+	}
+
+	// собираем все диалоги, берём peer и последнее сообщение
+	rows, err := Pool.Query(ctx, `
+SELECT c.id,
+       u.username,
+       u.display_name,
+       m.text,
+       EXTRACT(EPOCH FROM m.send_at)*1000 AS last_at
+  FROM chats c
+  JOIN chat_members cm ON cm.chat_id = c.id
+  JOIN chat_members cm2 ON cm2.chat_id = c.id AND cm2.user_id <> cm.user_id
+  JOIN users u ON u.id = cm2.user_id
+  LEFT JOIN LATERAL (
+      SELECT text, send_at
+        FROM messages
+       WHERE chat_id = c.id
+       ORDER BY send_at DESC
+       LIMIT 1
+  ) m ON true
+ WHERE c.is_group = false
+   AND cm.user_id = $1
+`, uid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chats []ChatSummary
+	for rows.Next() {
+		var ch ChatSummary
+		var lastAt float64
+		if err := rows.Scan(
+			&ch.ChatID,
+			&ch.Username,
+			&ch.Display,
+			&ch.LastMsg,
+			&lastAt,
+		); err != nil {
+			return nil, err
+		}
+		ch.LastAt = int64(lastAt)
+		chats = append(chats, ch)
+	}
+	return chats, nil
+}

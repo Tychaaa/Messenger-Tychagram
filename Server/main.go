@@ -12,12 +12,12 @@ import (
 
 // Packet — это структура, описывающая сообщение между клиентом и сервером
 type Packet struct {
-	Type  string   `json:"type"`           // Тип пакета: "msg" — сообщение, "users" — список пользователей
-	From  string   `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
-	To    string   `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
-	Text  string   `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
-	Ts    int64    `json:"ts,omitempty"`
-	Users []string `json:"users,omitempty"` // Список всех онлайн-пользователей (используется только при Type == "users")
+	Type  string        `json:"type"`           // Тип пакета: "msg" — сообщение, "users" — список пользователей
+	From  string        `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
+	To    string        `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
+	Text  string        `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
+	Ts    int64         `json:"ts,omitempty"`
+	Chats []ChatSummary `json:"chats,omitempty"`
 }
 
 // Глобальные переменные:
@@ -62,6 +62,20 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+func sendChats(username string, ws *websocket.Conn) {
+	ctx := context.Background()
+	chats, err := GetUserChats(ctx, username)
+	if err != nil {
+		log.Printf("sendChats: cannot fetch chats for %s: %v", username, err)
+		return
+	}
+	p := Packet{
+		Type:  "chats",
+		Chats: chats,
+	}
+	_ = ws.WriteJSON(p)
+}
+
 // handleWS обрабатывает новое подключение клиента по WebSocket
 func handleWS(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
@@ -90,8 +104,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	// Добавляем клиента в список и рассылаем обновлённый онлайн-лист
 	mu.Lock()
 	clients[user] = conn
-	pushUsersLocked()
 	mu.Unlock()
+
+	// сразу шлём список чатов
+	sendChats(user, conn)
 
 	go sendHistory(user, conn)
 
@@ -99,7 +115,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		mu.Lock()
 		delete(clients, user)
-		pushUsersLocked()
 		mu.Unlock()
 		conn.Close()
 	}()
@@ -127,7 +142,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 func router() {
 	for p := range broadcast {
 		if p.Type == "msg" {
-			go persistMsg(p) // не блокируем рассылку
+			persistMsg(p) // не блокируем рассылку
 		}
 
 		mu.Lock()
@@ -135,31 +150,17 @@ func router() {
 		// Отправляем сообщение получателю, если он онлайн
 		if dst, ok := clients[p.To]; ok {
 			_ = dst.WriteJSON(p) // отправляем JSON-пакет
+			// и обновим его список чатов
+			sendChats(p.To, dst)
 		}
 
 		// Отправляем сообщение обратно отправителю (эхо),
 		// если он не отправил его самому себе
 		if src, ok := clients[p.From]; ok && p.From != p.To {
 			_ = src.WriteJSON(p)
+			sendChats(p.From, src)
 		}
 
 		mu.Unlock() // разблокируем clients
-	}
-}
-
-// pushUsersLocked отправляет всем пользователям обновлённый список онлайна
-func pushUsersLocked() {
-	// Собираем имена всех пользователей в отдельный список
-	lst := make([]string, 0, len(clients))
-	for u := range clients {
-		lst = append(lst, u)
-	}
-
-	// Формируем пакет с типом "users" и этим списком
-	p := Packet{Type: "users", Users: lst}
-
-	// Отправляем этот пакет всем подключённым клиентам
-	for _, c := range clients {
-		_ = c.WriteJSON(p) // игнорируем ошибку при отправке
 	}
 }
