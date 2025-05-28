@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"      // Для вывода логов в консоль
 	"net/http" // Для запуска HTTP-сервера и обработки запросов
 	"sync"     // Для использования мьютекса
@@ -46,6 +47,8 @@ func main() {
 	defer CloseDB()
 
 	// Устанавливаем обработчик для WebSocket-подключений по адресу /ws
+	http.HandleFunc("/signup", signupHandler)
+	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/ws", handleWS)
 
 	// Запускаем отдельную горутину для обработки всех входящих сообщений
@@ -61,11 +64,19 @@ func main() {
 
 // handleWS обрабатывает новое подключение клиента по WebSocket
 func handleWS(w http.ResponseWriter, r *http.Request) {
-	// Получаем имя пользователя из URL-параметра ?user=
-	user := r.URL.Query().Get("user")
-	if user == "" {
-		// Если имя не указано — возвращаем ошибку и выходим
-		http.Error(w, "`user` param required", http.StatusBadRequest)
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "token required", 400)
+		return
+	}
+
+	var user string
+	err := Pool.QueryRow(context.Background(),
+		`SELECT u.username
+           FROM sessions s JOIN users u ON u.id = s.user_id
+          WHERE s.token=$1 AND s.expires_at > NOW()`, token).Scan(&user)
+	if err != nil {
+		http.Error(w, "invalid token", 401)
 		return
 	}
 
@@ -81,6 +92,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	clients[user] = conn
 	pushUsersLocked()
 	mu.Unlock()
+
+	go sendHistory(user, conn)
 
 	// Когда клиент отключится — удалим его и снова обновим онлайн-лист
 	defer func() {
@@ -113,7 +126,11 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 // 2. отправителю (From), чтобы он тоже увидел своё сообщение
 func router() {
 	for p := range broadcast {
-		mu.Lock() // блокируем доступ к clients
+		if p.Type == "msg" {
+			go persistMsg(p) // не блокируем рассылку
+		}
+
+		mu.Lock()
 
 		// Отправляем сообщение получателю, если он онлайн
 		if dst, ok := clients[p.To]; ok {
