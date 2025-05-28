@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
@@ -231,18 +232,60 @@ SELECT c.id,
 	var chats []ChatSummary
 	for rows.Next() {
 		var ch ChatSummary
-		var lastAt float64
+		var lastMsg sql.NullString
+		var lastAt sql.NullFloat64
 		if err := rows.Scan(
 			&ch.ChatID,
 			&ch.Username,
 			&ch.Display,
-			&ch.LastMsg,
+			&lastMsg,
 			&lastAt,
 		); err != nil {
 			return nil, err
 		}
-		ch.LastAt = int64(lastAt)
+		// Если в чате ещё нет сообщений — отдаём пустую строку
+		if lastMsg.Valid {
+			ch.LastMsg = lastMsg.String
+		} else {
+			ch.LastMsg = ""
+		}
+		if lastAt.Valid {
+			ch.LastAt = int64(lastAt.Float64)
+		} else {
+			ch.LastAt = 0
+		}
 		chats = append(chats, ch)
 	}
 	return chats, nil
+}
+
+type UserSummary struct {
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+}
+
+// SearchUsers ищет пользователей по username или display_name, исключая самого себя.
+func SearchUsers(ctx context.Context, self string, q string, limit int) ([]UserSummary, error) {
+	rows, err := Pool.Query(ctx, `
+SELECT username, display_name
+  FROM users
+ WHERE (username ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%')
+   AND username <> $2
+ ORDER BY username
+ LIMIT $3
+`, q, self, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var res []UserSummary
+	for rows.Next() {
+		var u UserSummary
+		if err := rows.Scan(&u.Username, &u.DisplayName); err != nil {
+			return nil, err
+		}
+		res = append(res, u)
+	}
+	return res, nil
 }

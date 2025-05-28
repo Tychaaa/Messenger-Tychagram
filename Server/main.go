@@ -49,6 +49,8 @@ func main() {
 	// Устанавливаем обработчик для WebSocket-подключений по адресу /ws
 	http.HandleFunc("/signup", signupHandler)
 	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/users/search", searchUsersHandler)
+	http.HandleFunc("/chats/direct", createDirectChatHandler)
 	http.HandleFunc("/ws", handleWS)
 
 	// Запускаем отдельную горутину для обработки всех входящих сообщений
