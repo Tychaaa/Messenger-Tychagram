@@ -1,4 +1,4 @@
-import time, json
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -14,7 +14,7 @@ from widgets    import BubbleWidget
 
 # Главное окно мессенджера
 class ChatWindow(QWidget):
-    def __init__(self, username: str):
+    def __init__(self, username: str, token: str):
         super().__init__()
         self.username = username                      # Имя текущего пользователя
         self.recipient = ""                           # Имя собеседника
@@ -22,11 +22,13 @@ class ChatWindow(QWidget):
 
         # Настройка окна
         self.setWindowTitle(f"Tychagram — {username}")
-        self.resize(700, 500)
+        self.resize(900, 600)
 
         # Список пользователей слева
         self.usersList = QListWidget()
-        self.usersList.currentTextChanged.connect(self.switch_chat)
+        self.usersList.itemClicked.connect(
+            lambda item: self.switch_chat(item.text())
+        )
 
         # Список сообщений справа
         self.messages = QListWidget()
@@ -71,7 +73,7 @@ class ChatWindow(QWidget):
         self.setStyleSheet(PASTEL_QSS)
 
         # WebSocket: создаём соединение с сервером
-        self.ws_bridge = WSBridge(username)
+        self.ws_bridge = WSBridge(username, token)
         self.ws_bridge.got_packet.connect(self.handle_packet)
 
     # Вызывается при выборе пользователя в списке.
@@ -121,6 +123,19 @@ class ChatWindow(QWidget):
     def handle_packet(self, pkt: dict):
         ptype = pkt.get("type") # Определяем тип пакета
 
+        if ptype == "history":
+            chat_id = pkt["chat_id"]  # пока можно игнорировать
+            for row in pkt["messages"]:  # {from,to,text,ts}
+                dt = datetime.fromtimestamp(row["ts"] / 1000,
+                                            timezone.utc).astimezone()
+                hhmm = dt.strftime("%H:%M")
+                peer = row["from"] if row["from"] != self.username else row["to"]
+                self.convs[peer].append((row["from"], row["text"], hhmm))
+            # если пользователь уже открыл этот диалог → перерисовать
+            if self.recipient == peer:
+                self.reload_chat_view()
+            return
+
         # Если это пакет со списком пользователей — обновляем список слева
         if ptype == "users":
             self.update_users(pkt["users"])
@@ -149,6 +164,10 @@ class ChatWindow(QWidget):
     def add_bubble(self, sender: str, text: str, time_str: str):
         outgoing = sender == self.username                  # Проверяем, наше ли это сообщение
         bubble = BubbleWidget(text, outgoing, time_str)     # Создаём виджет-пузырёк
+
+        max_w = int(self.messages.viewport().width() * 0.9)
+        bubble.setMaximumWidth(max_w)
+        bubble.adjustSize()
 
         # Создаём элемент списка, к которому прикрепим наш пузырёк
         item = QListWidgetItem()

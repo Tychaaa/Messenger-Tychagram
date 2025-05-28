@@ -12,7 +12,7 @@ class WSBridge(QObject):
     disconnected = pyqtSignal()     # Сигнал, испускается при отключении от сервера
 
     # Инициализация WebSocket-соединения и настройка сигналов
-    def __init__(self, username: str):
+    def __init__(self, username: str, token: str):
         super().__init__()
 
         # Создаём объект WebSocket-клиента
@@ -27,7 +27,7 @@ class WSBridge(QObject):
         self.ws.stateChanged.connect(self._state_changed)
 
         # Устанавливаем соединение с сервером, передаём имя пользователя
-        self.ws.open(QUrl(f"{SERVER_URL}?user={username}"))
+        self.ws.open(QUrl(f"{SERVER_URL}?token={token}"))
 
     # Отправляет словарь (пакет) как JSON через WebSocket
     def send(self, data: dict) -> bool:

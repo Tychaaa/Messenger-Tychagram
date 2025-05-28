@@ -1,6 +1,10 @@
 # Адрес сервера, к которому подключается клиент по WebSocket
 SERVER_URL = "ws://localhost:8080/ws"
 
+API_BASE   = "http://localhost:8080"
+SIGNUP_URL = f"{API_BASE}/signup"
+LOGIN_URL  = f"{API_BASE}/login"
+
 # Стилизация пастельно-зелёной темой
 PASTEL_QSS = """
         QWidget {
