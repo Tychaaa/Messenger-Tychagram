@@ -4,11 +4,12 @@ from datetime       import datetime, timezone
 
 from PyQt5.QtWidgets import (
     QWidget, QListWidget, QListWidgetItem, QLabel, QLineEdit, QPushButton,
-    QHBoxLayout, QVBoxLayout, QSplitter, QListView
+    QHBoxLayout, QVBoxLayout, QSplitter, QListView, QDialog
 )
 
 from constants  import PASTEL_QSS
 from models     import ChatListModel, ChatSummary
+from new_chat_dialog import NewChatDialog
 from ws         import WSBridge
 from widgets    import BubbleWidget, ChatItemDelegate
 
@@ -18,6 +19,7 @@ class ChatWindow(QWidget):
     def __init__(self, username: str, token: str):
         super().__init__()
         self.username = username                      # Имя текущего пользователя
+        self.token = token
         self.recipient = ""                           # Имя собеседника
         self.convs = defaultdict(list)                # История переписок: получатель → список сообщений
 
@@ -26,6 +28,10 @@ class ChatWindow(QWidget):
         self.resize(900, 600)
 
         # Список пользователей слева
+        self.newChatBtn = QPushButton("Новый чат")
+        self.newChatBtn.setObjectName("sendBtn")
+        self.newChatBtn.clicked.connect(self.open_new_chat)
+
         self.chatModel = ChatListModel(self)
         self.chatListView = QListView()
         self.chatListView.setModel(self.chatModel)
@@ -36,6 +42,12 @@ class ChatWindow(QWidget):
             "QListView{background:transparent;border:none;}"
         )
         self.chatListView.clicked.connect(self.on_chat_selected)
+
+        leftBox = QWidget()
+        leftLay = QVBoxLayout(leftBox)
+        leftLay.setContentsMargins(0, 0, 0, 0)
+        leftLay.addWidget(self.newChatBtn)
+        leftLay.addWidget(self.chatListView, 1)
 
         # Список сообщений справа
         self.messages = QListWidget()
@@ -68,7 +80,7 @@ class ChatWindow(QWidget):
 
         # Основной делитель экрана: слева список пользователей, справа чат
         splitter = QSplitter()
-        splitter.addWidget(self.chatListView)
+        splitter.addWidget(leftBox)
         splitter.addWidget(rightBox)
         splitter.setStretchFactor(1, 1)
 
@@ -82,6 +94,12 @@ class ChatWindow(QWidget):
         # WebSocket: создаём соединение с сервером
         self.ws_bridge = WSBridge(username, token)
         self.ws_bridge.got_packet.connect(self.handle_packet)
+
+    def open_new_chat(self):
+        dlg = NewChatDialog(self.token, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            # после успешного создания чат-лист придёт по WS push
+            pass
 
     # Вызывается при выборе пользователя в списке.
     # Обновляет заголовок чата, активирует поле ввода и загружает историю переписки.
@@ -119,15 +137,20 @@ class ChatWindow(QWidget):
         ptype = pkt.get("type") # Определяем тип пакета
 
         if ptype == "history":
-            chat_id = pkt["chat_id"]  # пока можно игнорировать
-            for row in pkt["messages"]:  # {from,to,text,ts}
-                dt = datetime.fromtimestamp(row["ts"] / 1000,
+            chat_id = pkt.get("chat_id")  # безопаснее через .get
+            # Берём список сообщений, или пустой список, если его нет
+            messages = pkt.get("messages") or []
+            last_peer = None
+            for row in messages:
+                dt = datetime.fromtimestamp(row.get("ts", 0) / 1000,
                                             timezone.utc).astimezone()
                 hhmm = dt.strftime("%H:%M")
-                peer = row["from"] if row["from"] != self.username else row["to"]
-                self.convs[peer].append((row["from"], row["text"], hhmm))
-            # если пользователь уже открыл этот диалог → перерисовать
-            if self.recipient == peer:
+                peer = row.get("from") if row.get("from") != self.username else row.get("to")
+                # сохраняем peer последнего сообщения
+                last_peer = peer
+                self.convs[peer].append((row.get("from"), row.get("text"), hhmm))
+            # Перерисовываем только если были сообщения и чат открыт
+            if last_peer and self.recipient == last_peer:
                 self.reload_chat_view()
             return
 

@@ -4,6 +4,8 @@ SERVER_URL = "ws://localhost:8080/ws"
 API_BASE   = "http://localhost:8080"
 SIGNUP_URL = f"{API_BASE}/signup"
 LOGIN_URL  = f"{API_BASE}/login"
+USER_SEARCH_URL = f"{API_BASE}/users/search"
+CHAT_CREATE_URL = f"{API_BASE}/chats/direct"
 
 # Стилизация пастельно-зелёной темой
 PASTEL_QSS = """

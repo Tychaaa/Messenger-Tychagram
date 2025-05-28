@@ -99,16 +99,17 @@ class ChatItemDelegate(QtWidgets.QStyledItemDelegate):
                          display)
 
         # — время
-        ts = datetime.fromtimestamp(last_at/1000)
-        timestr = ts.strftime("%H:%M")
-        font.setPointSize(10)
-        font.setBold(False)
-        painter.setFont(font)
-        painter.setPen(QtGui.QColor("#888888"))
-        painter.drawText(inner.x(), inner.y(),
-                         inner.width(), name_h,
-                         QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter,
-                         timestr)
+        if last_at > 0:
+            ts = datetime.fromtimestamp(last_at/1000)
+            timestr = ts.strftime("%H:%M")
+            font.setPointSize(10)
+            font.setBold(False)
+            painter.setFont(font)
+            painter.setPen(QtGui.QColor("#888888"))
+            painter.drawText(inner.x(), inner.y(),
+                             inner.width(), name_h,
+                             QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter,
+                             timestr)
 
         # 2) Сообщение под именем
         font.setPointSize(10)
