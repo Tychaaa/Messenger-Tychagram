@@ -1,40 +1,46 @@
 package main
 
 import (
-	"context"
-	"log"      // Для вывода логов в консоль
-	"net/http" // Для запуска HTTP-сервера и обработки запросов
-	"sync"     // Для использования мьютекса
-	"time"
+	"context"  // Пакет для управления контекстом выполнения
+	"log"      // Для логирования — вывода сообщений в консоль
+	"net/http" // Для создания HTTP-сервера и обработки HTTP-запросов
+	"sync"     // Для работы с синхронизацией (mutex)
+	"time"     // Для работы со временем — временные метки, таймауты
 
 	"github.com/gorilla/websocket" // Библиотека для работы с WebSocket-соединениями
 )
 
-// Packet — это структура, описывающая сообщение между клиентом и сервером
+// Packet — структура, описывающая формат сообщения,
+// которое пересылается между сервером и клиентами через WebSocket.
 type Packet struct {
-	Type   string        `json:"type"` // Тип пакета: "msg" — сообщение, "users" — список пользователей
-	ChatID int64         `json:"chat_id,omitempty"`
-	From   string        `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
-	To     string        `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
-	Text   string        `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
-	Ts     int64         `json:"ts,omitempty"`
-	Chats  []ChatSummary `json:"chats,omitempty"`
+	Type   string        `json:"type"`              // Тип пакета
+	ChatID int64         `json:"chat_id,omitempty"` // ID чата (группового или личного)
+	From   string        `json:"from,omitempty"`    // Имя отправителя (устанавливается сервером)
+	To     string        `json:"to"`                // Имя получателя (обязательно для личных сообщений)
+	Text   string        `json:"text,omitempty"`    // Текст сообщения (если Type == "msg")
+	Ts     int64         `json:"ts,omitempty"`      // Временная метка в миллисекундах
+	Chats  []ChatSummary `json:"chats,omitempty"`   // Используется при отправке списка чатов
 }
 
 // Глобальные переменные:
 var (
-	// clients — список всех подключённых пользователей:
-	// ключ — имя пользователя, значение — WebSocket-соединение
+	// clients — список всех подключённых по WebSocket пользователей:
+	// Ключ — имя пользователя (username), значение — WebSocket-соединение.
+	// Используется для отправки сообщений конкретным пользователям.
 	clients = map[string]*websocket.Conn{}
 
-	// mu — мьютекс для безопасного доступа к clients из разных горутин
+	// mu — мьютекс (mutex) для защиты clients от одновременного доступа
+	// из нескольких горутин. Без него возможны гонки данных
 	mu sync.Mutex
 
-	// broadcast — канал, в который попадают входящие сообщения от клиентов
-	// router() слушает этот канал и рассылает сообщения адресатам
+	// broadcast — канал для входящих сообщений.
+	// Клиенты отправляют пакеты в этот канал, а функция router()
+	// забирает их и рассылает нужным адресатам.
 	broadcast = make(chan Packet, 1024)
 
-	// upg — конфигурация WebSocket-апгрейда (разрешаем все входящие соединения)
+	// upg — конфигурация апгрейда HTTP-соединения до WebSocket.
+	// CheckOrigin всегда возвращает true → разрешаем подключение с любого источника.
+	// В реальных условиях стоит делать проверку (например, по токену).
 	upg = websocket.Upgrader{
 		CheckOrigin: func(*http.Request) bool {
 			return true
@@ -43,52 +49,85 @@ var (
 )
 
 func main() {
-	// Инициализируем БД
+	// Инициализируем подключение к базе данных и пул соединений
 	InitDB()
+	// Закрываем пул соединений при завершении работы сервера
 	defer CloseDB()
 
-	// Устанавливаем обработчик для WebSocket-подключений по адресу /ws
-	http.HandleFunc("/signup", signupHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/users/search", searchUsersHandler)
-	http.HandleFunc("/chats/direct", createDirectChatHandler)
-	http.HandleFunc("/chats/group", createGroupChatHandler)
-	http.HandleFunc("/ws", handleWS)
+	// Регистрируем HTTP-обработчики для различных маршрутов:
+	http.HandleFunc("/signup", signupHandler)                 // регистрация пользователя
+	http.HandleFunc("/login", loginHandler)                   // вход пользователя
+	http.HandleFunc("/users/search", searchUsersHandler)      // поиск пользователей
+	http.HandleFunc("/chats/direct", createDirectChatHandler) // создание личного чата
+	http.HandleFunc("/chats/group", createGroupChatHandler)   // создание группового чата
+	http.HandleFunc("/ws", handleWS)                          // WebSocket-соединение
 
-	// Запускаем отдельную горутину для обработки всех входящих сообщений
+	// Запускаем отдельную горутину, которая будет слушать канал broadcast
+	// и рассылать сообщения клиентам
 	go router()
 
-	// Печатаем в консоль, что сервер запущен
+	// Выводим сообщение о запуске сервера в консоль
 	log.Println("Tychagram server listening on :8080")
 
-	// Запускаем HTTP-сервер на порту 8080 (будет обрабатывать входящие подключения)
-	// log.Fatal завершит программу, если сервер не запустится или произойдёт ошибка
+	// Запускаем HTTP-сервер на порту 8080.
+	// log.Fatal завершит выполнение программы, если произойдёт ошибка запуска
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func sendChats(username string, ws *websocket.Conn) {
+	/**
+	Отправляет пользователю обновлённый список его чатов через WebSocket.
+
+	Параметры:
+	- username: имя пользователя, которому нужно отправить список;
+	- ws: его WebSocket-соединение.
+
+	Используется:
+	- после входа в систему;
+	- при создании нового чата;
+	- при получении/отправке сообщения.
+	*/
+
 	ctx := context.Background()
+
+	// Получаем список чатов пользователя из базы данных
 	chats, err := GetUserChats(ctx, username)
 	if err != nil {
 		log.Printf("sendChats: cannot fetch chats for %s: %v", username, err)
-		return
+		return // Если не удалось — просто выходим
 	}
+
+	// Формируем пакет с типом "chats" и прикреплённым списком чатов
 	p := Packet{
 		Type:  "chats",
 		Chats: chats,
 	}
+
+	// Отправляем JSON-пакет через WebSocket
 	_ = ws.WriteJSON(p)
 }
 
-// handleWS обрабатывает новое подключение клиента по WebSocket
 func handleWS(w http.ResponseWriter, r *http.Request) {
+	/**
+	Обрабатывает подключение клиента по WebSocket:
+	- проверяет токен авторизации;
+	- апгрейдит соединение;
+	- добавляет клиента в список;
+	- слушает входящие сообщения и отправляет их в канал broadcast.
+	*/
+
+	// Получаем токен из строки запроса
 	token := r.URL.Query().Get("token")
 	if token == "" {
 		http.Error(w, "token required", 400)
 		return
 	}
 
+	// Проверяем токен: ищем соответствующего пользователя в сессиях
 	var user string
+
+	// Ищем имя пользователя (u.username), связанное с переданным токеном.
+	// Условие: токен должен быть действующим.
 	err := Pool.QueryRow(context.Background(),
 		`SELECT u.username
            FROM sessions s JOIN users u ON u.id = s.user_id
@@ -98,24 +137,25 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Обновляем соединение до WebSocket
+	// Преобразуем HTTP-соединение в WebSocket
 	conn, err := upg.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade:", err)
 		return
 	}
 
-	// Добавляем клиента в список и рассылаем обновлённый онлайн-лист
+	// Добавляем клиента в список подключённых пользователей
 	mu.Lock()
 	clients[user] = conn
 	mu.Unlock()
 
-	// сразу шлём список чатов
+	// Отправляем клиенту список всех его чатов
 	sendChats(user, conn)
 
+	// Параллельно отправляем клиенту историю сообщений
 	go sendHistory(user, conn)
 
-	// Когда клиент отключится — удалим его и снова обновим онлайн-лист
+	// Когда соединение завершится — удалим клиента из списка и закроем соединение
 	defer func() {
 		mu.Lock()
 		delete(clients, user)
@@ -123,57 +163,70 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 	}()
 
-	// Основной цикл чтения входящих сообщений от клиента
+	// === Цикл получения сообщений от клиента ===
 	for {
 		var p Packet
-		// Пытаемся прочитать JSON-пакет от клиента
+
+		// Ждём новое сообщение от клиента в формате JSON
 		if err := conn.ReadJSON(&p); err != nil {
-			break // соединение закрылось или произошла ошибка — выходим из цикла
+			break // соединение закрыто или произошла ошибка
 		}
 
-		// Обрабатываем только личные сообщения
+		// Обрабатываем только сообщения типа "msg"
 		if p.Type == "msg" {
-			p.From = user // выставляем имя отправителя
-			p.Ts = time.Now().UnixMilli()
-			broadcast <- p // передаём сообщение в канал для пересылки
+			p.From = user                 // Устанавливаем имя отправителя
+			p.Ts = time.Now().UnixMilli() // Временная метка отправки
+			broadcast <- p                // Отправляем сообщение в канал
 		}
 	}
 }
 
-// router — постоянно слушает канал broadcast и рассылает сообщения:
-// 1. получателю (To)
-// 2. отправителю (From), чтобы он тоже увидел своё сообщение
 func router() {
+	/**
+	Фоновая горутина, которая постоянно слушает канал broadcast и
+	рассылает входящие сообщения нужным пользователям через WebSocket.
+
+	Также сохраняет каждое сообщение в базу данных и обновляет списки чатов у участников.
+	*/
+
 	for p := range broadcast {
-		// сохраняем сообщение (сейчас единая функция)
+		// Сохраняем сообщение в базу данных (в зависимости от типа чата)
 		if err := persistMsg(p); err != nil {
 			log.Printf("router: persistMsg failed: %v", err)
 		}
 
-		mu.Lock()
+		mu.Lock() // Блокируем доступ к clients на время рассылки
+
+		// === Групповое сообщение ===
 		if p.ChatID != 0 {
-			// групповая рассылка
+			// Получаем список всех участников этого чата
 			members, err := GetChatMembers(context.Background(), p.ChatID)
 			if err != nil {
 				log.Printf("router: GetChatMembers failed: %v", err)
 			}
+
+			// Рассылаем сообщение каждому участнику
 			for _, uname := range members {
 				if conn, ok := clients[uname]; ok {
-					conn.WriteJSON(p)
-					sendChats(uname, conn)
+					conn.WriteJSON(p)      // Отправляем сообщение
+					sendChats(uname, conn) // Обновляем список чатов
 				}
 			}
+
+			// === Личное сообщение ===
 		} else {
-			// личное сообщение
+			// Отправляем получателю
 			if dst, ok := clients[p.To]; ok {
 				dst.WriteJSON(p)
 				sendChats(p.To, dst)
 			}
+
+			// Отправляем копию отправителю (чтобы он тоже увидел своё сообщение)
 			if src, ok := clients[p.From]; ok {
 				src.WriteJSON(p)
 				sendChats(p.From, src)
 			}
 		}
-		mu.Unlock()
+		mu.Unlock() // Освобождаем мьютекс
 	}
 }

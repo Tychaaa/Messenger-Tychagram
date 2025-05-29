@@ -4,25 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/gorilla/websocket"
-	"github.com/jackc/pgx/v5"
 	"log"
 	"os"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool" // Библиотека для работы с PostgreSQL через пул соединений
+	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"         // Базовый PostgreSQL-драйвер
+	"github.com/jackc/pgx/v5/pgxpool" // Расширение: пул подключений к PostgreSQL
 )
 
-// Строка подключения по умолчанию
+// Строка подключения по умолчанию (используется, если не задана через переменную окружения)
 const defaultDSN = "postgres://postgres:tychaaa@localhost:5432/messenger?sslmode=disable"
 
-// Pool — глобальный пул соединений к базе данных
-// Используется во всех функциях, которые работают с PostgreSQL
+// Pool — глобальный пул соединений к базе данных.
+// Используется во всех частях проекта для работы с PostgreSQL
 var Pool *pgxpool.Pool
 
-// InitDB подключается к PostgreSQL, создаёт пул соединений и проверяет соединение
 func InitDB() {
-	// Получаем строку подключения из переменной окружения, если она есть
+	/**
+	InitDB инициализирует подключение к базе данных PostgreSQL.
+	Подключается с использованием строки DSN, проверяет доступность БД,
+	и сохраняет пул соединений в глобальную переменную Pool.
+	*/
+
+	// Получаем строку подключения из переменной окружения (если она задана)
 	dsn := os.Getenv("POSTGRES_DSN")
 	if dsn == "" {
 		// Если переменная не задана — используем значение по умолчанию
@@ -30,14 +35,15 @@ func InitDB() {
 	}
 
 	var err error
-	// Создаём новый пул соединений
+
+	// Создаём пул соединений с базой данных
 	Pool, err = pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		// Если не удалось подключиться — завершаем программу
+		// Ошибка создания пула → логируем и завершаем программу
 		log.Fatalf("Failed to create PostgreSQL connection pool: %v", err)
 	}
 
-	// Проверяем, что соединение с БД работает
+	// Проверяем, отвечает ли база данных (делаем ping)
 	if err = Pool.Ping(context.Background()); err != nil {
 		log.Fatalf("PostgreSQL is not responding to ping: %v", err)
 	}
@@ -46,20 +52,32 @@ func InitDB() {
 	log.Println("PostgreSQL connection pool is ready")
 }
 
-// CloseDB закрывает пул соединений
-func CloseDB() { Pool.Close() }
+func CloseDB() {
+	/**
+	CloseDB закрывает пул соединений с базой данных PostgreSQL.
+	Вызывается при завершении работы сервера для корректного освобождения ресурсов.
+	*/
+	Pool.Close()
+}
 
 func persistMsg(p Packet) error {
+	/**
+	Сохраняет сообщение из WebSocket-пакета в базу данных.
+
+	Если сообщение отправлено в групповой чат — использует p.ChatID.
+	Если сообщение личное — определяет чат по участникам и создаёт его при необходимости.
+	*/
+
 	ctx := context.Background()
 
-	// 1) находим ID отправителя
+	// Получаем ID отправителя по имени
 	fromID, err := getUserID(ctx, p.From)
 	if err != nil {
 		log.Printf("unknown sender %q: %v", p.From, err)
 		return err
 	}
 
-	// 2) если групповой — используем p.ChatID напрямую
+	// === Групповой чат ===
 	if p.ChatID != 0 {
 		_, err := Pool.Exec(ctx,
 			`INSERT INTO messages (chat_id, sender_id, text) VALUES ($1, $2, $3)`,
@@ -72,17 +90,23 @@ func persistMsg(p Packet) error {
 		return nil
 	}
 
-	// 3) иначе — direct chat (как раньше)
+	// === Личное сообщение ===
+
+	// Получаем ID получателя
 	toID, err := getUserID(ctx, p.To)
 	if err != nil {
 		log.Printf("unknown recipient %q: %v", p.To, err)
 		return err
 	}
+
+	// Убеждаемся, что чат существует (или создаём новый)
 	chatID, err := ensureDirectChat(ctx, fromID, toID)
 	if err != nil {
 		log.Printf("ensuring chat: %v", err)
 		return err
 	}
+
+	// Сохраняем сообщение в БД
 	_, err = Pool.Exec(ctx,
 		`INSERT INTO messages (chat_id, sender_id, text) VALUES ($1, $2, $3)`,
 		chatID, fromID, p.Text,
@@ -91,11 +115,17 @@ func persistMsg(p Packet) error {
 		log.Printf("insert msg: %v", err)
 		return err
 	}
+
 	return nil
 }
 
-// getUserID возвращает ID существующего пользователя или ошибку
 func getUserID(ctx context.Context, username string) (int64, error) {
+	/**
+	Возвращает ID пользователя по его username.
+
+	Если пользователь не найден — возвращает ошибку.
+	*/
+
 	var id int64
 	err := Pool.QueryRow(ctx,
 		`SELECT id FROM users WHERE username=$1`, username).
@@ -106,14 +136,21 @@ func getUserID(ctx context.Context, username string) (int64, error) {
 	return id, nil
 }
 
-// ensureDirectChat гарантирует, что личный чат между u1 и u2 существует.
-// Если нет — создаёт записи в chats и chat_members.
 func ensureDirectChat(ctx context.Context, u1, u2 int64) (int64, error) {
+	/**
+	Гарантирует наличие личного чата между двумя пользователями.
+	Если такой чат уже существует — возвращает его ID.
+	Если нет — создаёт новый чат и добавляет в него обоих участников.
+	*/
+
+	// Упорядочиваем ID, чтобы избежать дубликатов в разных порядках
 	if u1 > u2 {
 		u1, u2 = u2, u1
 	}
 
 	var chatID int64
+
+	// Ищем существующий чат между двумя пользователями (не групповой)
 	err := Pool.QueryRow(ctx,
 		`SELECT c.id
            FROM chats c
@@ -122,14 +159,16 @@ func ensureDirectChat(ctx context.Context, u1, u2 int64) (int64, error) {
           WHERE c.is_group = false
           LIMIT 1`, u1, u2).Scan(&chatID)
 
+	// Если не найдено — создаём новый личный чат
 	if err == pgx.ErrNoRows {
-		// создаём новый чат
+		// Вставляем запись о новом чате
 		if err = Pool.QueryRow(ctx,
 			`INSERT INTO chats (is_group) VALUES (false) RETURNING id`,
 		).Scan(&chatID); err != nil {
 			return 0, err
 		}
-		// добавляем участников
+
+		// Добавляем обоих участников в таблицу chat_members
 		if _, err = Pool.Exec(ctx,
 			`INSERT INTO chat_members (chat_id, user_id)
              VALUES ($1, $2), ($1, $3)`,
@@ -137,31 +176,41 @@ func ensureDirectChat(ctx context.Context, u1, u2 int64) (int64, error) {
 			return 0, err
 		}
 	}
+
+	// Возвращаем ID чата (существующего или нового)
 	return chatID, err
 }
 
 func sendHistory(username string, ws *websocket.Conn) {
+	/**
+	Отправляет пользователю историю сообщений для всех его чатов (до 50 сообщений на чат).
+	Вызывается при подключении клиента по WebSocket.
+	*/
+
 	ctx := context.Background()
-	// находим ID
+
+	// Получаем ID пользователя по username
 	var uid int64
 	_ = Pool.QueryRow(ctx,
 		`SELECT id FROM users WHERE username=$1`, username,
 	).Scan(&uid)
 
-	// выбираем все чаты (личные и групповые), где есть этот пользователь
+	// Получаем ID всех чатов, в которых состоит пользователь
 	rows, _ := Pool.Query(ctx,
 		`SELECT c.id
            FROM chats c
            JOIN chat_members m ON m.chat_id = c.id
           WHERE m.user_id = $1`, uid,
 	)
+	// Закрываем результат после завершения чтения всех chat_id
 	defer rows.Close()
 
 	for rows.Next() {
 		var chatID int64
+		// Получаем chat_id из строки результата
 		_ = rows.Scan(&chatID)
 
-		// берём до 50 сообщений в хронологическом порядке
+		// Извлекаем до 50 сообщений из чата в хронологическом порядке
 		msgRows, _ := Pool.Query(ctx,
 			`SELECT u.username, m.text, m.send_at
                FROM messages m
@@ -171,11 +220,15 @@ func sendHistory(username string, ws *websocket.Conn) {
               LIMIT 50`, chatID,
 		)
 
+		// Список сообщений в текущем чате (для отправки клиенту)
 		var msgs []map[string]interface{}
 		for msgRows.Next() {
 			var from, text string
 			var ts time.Time
+			// Считываем отправителя, текст и временную метку из строки результата
 			_ = msgRows.Scan(&from, &text, &ts)
+
+			// Добавляем сообщение в список
 			msgs = append(msgs, map[string]interface{}{
 				"from": from,
 				"text": text,
@@ -184,7 +237,7 @@ func sendHistory(username string, ws *websocket.Conn) {
 		}
 		msgRows.Close()
 
-		// шлём историю вместе с chat_id
+		// Отправляем клиенту историю сообщений по текущему чату
 		_ = ws.WriteJSON(map[string]interface{}{
 			"type":     "history",
 			"chat_id":  chatID,
@@ -195,18 +248,24 @@ func sendHistory(username string, ws *websocket.Conn) {
 
 // ChatSummary описывает одну запись в списке чатов
 type ChatSummary struct {
-	ChatID   int64  `json:"chat_id"`
-	IsGroup  bool   `json:"is_group"`
-	Title    string `json:"title,omitempty"`
-	Username string `json:"username,omitempty"`
-	Display  string `json:"display"`
-	LastMsg  string `json:"last_msg"`
-	LastAt   int64  `json:"last_at"` // Unix ms последнего сообщения
+	ChatID   int64  `json:"chat_id"`            // Уникальный ID чата
+	IsGroup  bool   `json:"is_group"`           // Является ли чат групповым
+	Title    string `json:"title,omitempty"`    // Название (для групповых чатов)
+	Username string `json:"username,omitempty"` // Имя собеседника (для личных чатов)
+	Display  string `json:"display"`            // Имя или название для отображения
+	LastMsg  string `json:"last_msg"`           // Последнее сообщение
+	LastAt   int64  `json:"last_at"`            // Время последнего сообщения
 }
 
-// GetUserChats возвращает список личных чатов пользователя с последним сообщением
 func GetUserChats(ctx context.Context, username string) ([]ChatSummary, error) {
-	// 1) находим ID пользователя
+	/**
+	Возвращает список чатов пользователя с последними сообщениями.
+
+	В выборку попадают как групповые, так и личные чаты, отсортированные по дате последнего сообщения.
+	Каждый элемент — это ChatSummary, содержащий ID, тип, отображаемое имя, последнее сообщение и его время.
+	*/
+
+	// 1) Получаем ID пользователя по его username
 	var uid int64
 	if err := Pool.QueryRow(ctx,
 		`SELECT id FROM users WHERE username = $1`, username,
@@ -214,44 +273,64 @@ func GetUserChats(ctx context.Context, username string) ([]ChatSummary, error) {
 		return nil, fmt.Errorf("getUserChats: %w", err)
 	}
 
-	// 2) выбираем все чаты (личные и групповые) с последним сообщением
+	// 2) Извлекаем чаты, в которых участвует пользователь, вместе с последним сообщением
 	rows, err := Pool.Query(ctx, `
-SELECT
-  c.id,
-  c.is_group,
-  c.title,
-  CASE WHEN c.is_group THEN '' ELSE u.username END   AS username,
-  CASE WHEN c.is_group THEN c.title ELSE u.display_name END AS display,
-  m.text,
-  EXTRACT(EPOCH FROM m.send_at)*1000 AS last_at
-FROM chats c
-JOIN chat_members cm ON cm.chat_id = c.id
-LEFT JOIN chat_members cm2
-  ON cm2.chat_id = c.id AND cm2.user_id <> cm.user_id
-LEFT JOIN users u
-  ON u.id = cm2.user_id
-LEFT JOIN LATERAL (
-    SELECT text, send_at
-      FROM messages
-     WHERE chat_id = c.id
-     ORDER BY send_at DESC
-     LIMIT 1
-) m ON true
-WHERE cm.user_id = $1
-ORDER BY COALESCE(EXTRACT(EPOCH FROM m.send_at), EXTRACT(EPOCH FROM c.created_at))*1000 DESC
-`, uid)
+		SELECT
+		    -- Извлекаем список чатов пользователя с их последним сообщением
+		  c.id,                              -- ID чата
+		  c.is_group,                        -- Признак группового чата
+		  c.title,                           -- Название (только для групповых)
+		  
+		  -- Для личных чатов: имя собеседника, для групп — пустая строка
+		  CASE WHEN c.is_group THEN '' ELSE u.username END AS username,
+		  
+		  -- Отображаемое имя: название группы или имя собеседника
+		  CASE WHEN c.is_group THEN c.title ELSE u.display_name END AS display,
+		  
+		  m.text,                            -- Текст последнего сообщения
+		  
+		  -- Время последнего сообщения в миллисекундах Unix-времени
+		  EXTRACT(EPOCH FROM m.send_at)*1000 AS last_at
+
+		FROM chats c
+		JOIN chat_members cm ON cm.chat_id = c.id          -- текущий пользователь состоит в чате
+
+		-- Ищем второго участника (для личных чатов)
+		LEFT JOIN chat_members cm2
+		  ON cm2.chat_id = c.id AND cm2.user_id <> cm.user_id
+
+		-- Получаем его имя
+		LEFT JOIN users u ON u.id = cm2.user_id
+
+		-- Последнее сообщение в чате (используем подзапрос через LATERAL)
+		LEFT JOIN LATERAL (
+			SELECT text, send_at
+			  FROM messages
+			 WHERE chat_id = c.id
+			 ORDER BY send_at DESC
+			 LIMIT 1
+		) m ON true
+
+		-- Оставляем только чаты, где состоит указанный пользователь
+		WHERE cm.user_id = $1
+
+		-- Сортировка по дате последнего сообщения (или дате создания, если сообщений не было)
+		ORDER BY COALESCE(EXTRACT(EPOCH FROM m.send_at), EXTRACT(EPOCH FROM c.created_at)) * 1000 DESC
+	`, uid)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	// Преобразуем результат в []ChatSummary
 	var chats []ChatSummary
 	for rows.Next() {
-		var ch ChatSummary
-		var title sql.NullString
-		var lastMsg sql.NullString
-		var lastAt sql.NullFloat64
+		var ch ChatSummary         // Один чат
+		var title sql.NullString   // Название чата (может быть NULL)
+		var lastMsg sql.NullString // Последнее сообщение (может быть NULL)
+		var lastAt sql.NullFloat64 // Время последнего сообщения в ms (может быть NULL)
 
+		// Считываем данные из строки результата
 		if err := rows.Scan(
 			&ch.ChatID,
 			&ch.IsGroup,
@@ -264,50 +343,66 @@ ORDER BY COALESCE(EXTRACT(EPOCH FROM m.send_at), EXTRACT(EPOCH FROM c.created_at
 			return nil, err
 		}
 
-		// title может быть NULL для личных чатов
+		// Обработка NULL-значений, которые могли прийти из БД:
+
+		// Если это групповой чат, title будет заполнен, иначе — NULL
 		if title.Valid {
 			ch.Title = title.String
 		} else {
 			ch.Title = ""
 		}
-		// последний текст или пустая строка
+
+		/// Последнее сообщение может отсутствовать (если чат пуст)
 		if lastMsg.Valid {
 			ch.LastMsg = lastMsg.String
 		} else {
 			ch.LastMsg = ""
 		}
-		// время в ms или 0
+
+		// Метка времени может отсутствовать (если сообщений не было)
 		if lastAt.Valid {
 			ch.LastAt = int64(lastAt.Float64)
 		} else {
 			ch.LastAt = 0
 		}
 
+		// Добавляем чат в общий список
 		chats = append(chats, ch)
 	}
+
+	// Возвращаем все собранные чаты
 	return chats, nil
 }
 
+// UserSummary содержит минимальную информацию о пользователе
+// для отображения в результатах поиска
 type UserSummary struct {
-	Username    string `json:"username"`
-	DisplayName string `json:"display_name"`
+	Username    string `json:"username"`     // Уникальное имя пользователя
+	DisplayName string `json:"display_name"` // Имя, отображаемое в UI
 }
 
-// SearchUsers ищет пользователей по username или display_name, исключая самого себя.
 func SearchUsers(ctx context.Context, self string, q string, limit int) ([]UserSummary, error) {
+	/**
+	Выполняет поиск пользователей по username или имени (display_name).
+	Исключает самого себя из результатов.
+	Результаты ограничены по количеству (limit) и отсортированы по алфавиту.
+	*/
+
+	// Выполняем SQL-запрос с фильтрацией по частичному совпадению
 	rows, err := Pool.Query(ctx, `
-SELECT username, display_name
-  FROM users
- WHERE (username ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%')
-   AND username <> $2
- ORDER BY username
- LIMIT $3
-`, q, self, limit)
+		SELECT username, display_name
+		  FROM users
+		 WHERE (username ILIKE '%'||$1||'%' OR display_name ILIKE '%'||$1||'%')
+		   AND username <> $2
+		 ORDER BY username
+		 LIMIT $3
+		`, q, self, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	// Сканируем результаты в срез структур UserSummary
 	var res []UserSummary
 	for rows.Next() {
 		var u UserSummary
@@ -320,14 +415,24 @@ SELECT username, display_name
 }
 
 func CreateGroupChat(ctx context.Context, ownerID int64, title string, memberIDs []int64) (int64, error) {
+	/**
+	Создаёт новый групповой чат в базе данных.
+
+	Шаги:
+	1. Начинает транзакцию.
+	2. Создаёт запись в таблице chats.
+	3. Добавляет всех участников, включая создателя, в chat_members.
+	4. Завершает транзакцию.
+	*/
+
 	// Начинаем транзакцию
 	tx, err := Pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(ctx) // откат на случай ошибки
 
-	// 1) Вставляем запись в chats
+	// 1) Создаём сам чат (is_group = true)
 	var chatID int64
 	err = tx.QueryRow(ctx,
 		`INSERT INTO chats (is_group, title, owner_id) 
@@ -338,15 +443,16 @@ func CreateGroupChat(ctx context.Context, ownerID int64, title string, memberIDs
 		return 0, fmt.Errorf("insert chat: %w", err)
 	}
 
-	// 2) Вставляем участников
-	// Обязательно включаем создателя
+	// 2) Собираем участников без дубликатов, включая создателя
 	seen := map[int64]bool{ownerID: true}
 	for _, uid := range memberIDs {
 		if uid == ownerID {
-			continue
+			continue // не добавляем дважды
 		}
 		seen[uid] = true
 	}
+
+	// Вставляем всех участников в таблицу chat_members
 	for uid := range seen {
 		if _, err = tx.Exec(ctx,
 			`INSERT INTO chat_members (chat_id, user_id) VALUES ($1, $2)`,
@@ -356,33 +462,21 @@ func CreateGroupChat(ctx context.Context, ownerID int64, title string, memberIDs
 		}
 	}
 
-	// 3) Фиксим транзакцию
+	// 3) Подтверждаем транзакцию
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit tx: %w", err)
 	}
 	return chatID, nil
 }
 
-// persistGroupMsg сохраняет групповое сообщение в messages
-func persistGroupMsg(p Packet) error {
-	// получаем sender_id
-	var uid int64
-	if err := Pool.QueryRow(context.Background(),
-		`SELECT id FROM users WHERE username=$1`, p.From,
-	).Scan(&uid); err != nil {
-		return err
-	}
-	// вставляем в messages: chat_id, user_id, text, send_at
-	_, err := Pool.Exec(context.Background(),
-		`INSERT INTO messages (chat_id, sender_id, text, send_at)
-         VALUES ($1, $2, $3, NOW())`,
-		p.ChatID, uid, p.Text,
-	)
-	return err
-}
-
-// GetChatMembers возвращает всех username участников чата
 func GetChatMembers(ctx context.Context, chatID int64) ([]string, error) {
+	/**
+	Возвращает список username всех участников заданного чата.
+
+	Запрашивает из базы пользователей, связанных с chat_id через таблицу chat_members.
+	*/
+
+	// Получаем список имён пользователей, входящих в чат
 	rows, err := Pool.Query(ctx,
 		`SELECT u.username
            FROM chat_members cm
@@ -400,6 +494,7 @@ func GetChatMembers(ctx context.Context, chatID int64) ([]string, error) {
 		if err := rows.Scan(&uname); err != nil {
 			return nil, err
 		}
+		// Добавляем имя участника в результат
 		users = append(users, uname)
 	}
 	return users, nil
