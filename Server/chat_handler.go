@@ -107,3 +107,71 @@ func createDirectChatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 }
+
+type createGroupReq struct {
+	Title     string   `json:"title"`
+	Usernames []string `json:"usernames"`
+}
+
+func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	// 1) Аутентификация
+	creator, err := authUsername(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// 2) Парсим тело запроса
+	var req createGroupReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if req.Title == "" || len(req.Usernames) == 0 {
+		http.Error(w, "title and at least one user required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+	// 3) Получаем ID создателя
+	ownerID, err := getUserID(ctx, creator)
+	if err != nil {
+		http.Error(w, "unknown creator", http.StatusBadRequest)
+		return
+	}
+	// 4) Получаем ID всех указанных пользователей
+	var memberIDs []int64
+	for _, uname := range req.Usernames {
+		uid, err := getUserID(ctx, uname)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("user %s not found", uname), http.StatusNotFound)
+			return
+		}
+		memberIDs = append(memberIDs, uid)
+	}
+
+	// 5) Создаём групповой чат
+	chatID, err := CreateGroupChat(ctx, ownerID, req.Title, memberIDs)
+	if err != nil {
+		http.Error(w, "cannot create group chat", http.StatusInternalServerError)
+		return
+	}
+
+	// 6) Ответим клиенту
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int64{"chat_id": chatID})
+
+	// 7) Пушим обновлённый список чатов всем участникам (включая создателя)
+	participants := append(req.Usernames, creator)
+	mu.Lock()
+	for _, uname := range participants {
+		if conn, ok := clients[uname]; ok {
+			sendChats(uname, conn)
+		}
+	}
+	mu.Unlock()
+}

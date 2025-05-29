@@ -12,12 +12,13 @@ import (
 
 // Packet — это структура, описывающая сообщение между клиентом и сервером
 type Packet struct {
-	Type  string        `json:"type"`           // Тип пакета: "msg" — сообщение, "users" — список пользователей
-	From  string        `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
-	To    string        `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
-	Text  string        `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
-	Ts    int64         `json:"ts,omitempty"`
-	Chats []ChatSummary `json:"chats,omitempty"`
+	Type   string        `json:"type"` // Тип пакета: "msg" — сообщение, "users" — список пользователей
+	ChatID int64         `json:"chat_id,omitempty"`
+	From   string        `json:"from,omitempty"` // Отправитель (сервер подставляет сам при получении сообщения)
+	To     string        `json:"to"`             // Получатель (обязательное поле для отправки сообщения)
+	Text   string        `json:"text,omitempty"` // Текст сообщения (используется только при Type == "msg")
+	Ts     int64         `json:"ts,omitempty"`
+	Chats  []ChatSummary `json:"chats,omitempty"`
 }
 
 // Глобальные переменные:
@@ -51,6 +52,7 @@ func main() {
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/users/search", searchUsersHandler)
 	http.HandleFunc("/chats/direct", createDirectChatHandler)
+	http.HandleFunc("/chats/group", createGroupChatHandler)
 	http.HandleFunc("/ws", handleWS)
 
 	// Запускаем отдельную горутину для обработки всех входящих сообщений
@@ -130,7 +132,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Обрабатываем только личные сообщения
-		if p.Type == "msg" && p.To != "" && p.To != user {
+		if p.Type == "msg" {
 			p.From = user // выставляем имя отправителя
 			p.Ts = time.Now().UnixMilli()
 			broadcast <- p // передаём сообщение в канал для пересылки
@@ -143,26 +145,35 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 // 2. отправителю (From), чтобы он тоже увидел своё сообщение
 func router() {
 	for p := range broadcast {
-		if p.Type == "msg" {
-			persistMsg(p) // не блокируем рассылку
+		// сохраняем сообщение (сейчас единая функция)
+		if err := persistMsg(p); err != nil {
+			log.Printf("router: persistMsg failed: %v", err)
 		}
 
 		mu.Lock()
-
-		// Отправляем сообщение получателю, если он онлайн
-		if dst, ok := clients[p.To]; ok {
-			_ = dst.WriteJSON(p) // отправляем JSON-пакет
-			// и обновим его список чатов
-			sendChats(p.To, dst)
+		if p.ChatID != 0 {
+			// групповая рассылка
+			members, err := GetChatMembers(context.Background(), p.ChatID)
+			if err != nil {
+				log.Printf("router: GetChatMembers failed: %v", err)
+			}
+			for _, uname := range members {
+				if conn, ok := clients[uname]; ok {
+					conn.WriteJSON(p)
+					sendChats(uname, conn)
+				}
+			}
+		} else {
+			// личное сообщение
+			if dst, ok := clients[p.To]; ok {
+				dst.WriteJSON(p)
+				sendChats(p.To, dst)
+			}
+			if src, ok := clients[p.From]; ok {
+				src.WriteJSON(p)
+				sendChats(p.From, src)
+			}
 		}
-
-		// Отправляем сообщение обратно отправителю (эхо),
-		// если он не отправил его самому себе
-		if src, ok := clients[p.From]; ok && p.From != p.To {
-			_ = src.WriteJSON(p)
-			sendChats(p.From, src)
-		}
-
-		mu.Unlock() // разблокируем clients
+		mu.Unlock()
 	}
 }
