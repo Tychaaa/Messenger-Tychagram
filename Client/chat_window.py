@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 from constants  import PASTEL_QSS
 from models     import ChatListModel, ChatSummary
 from new_chat_dialog import NewChatDialog
+from new_group_dialog import NewGroupDialog
 from ws         import WSBridge
 from widgets    import BubbleWidget, ChatItemDelegate
 
@@ -21,6 +22,8 @@ class ChatWindow(QWidget):
         self.username = username                      # Имя текущего пользователя
         self.token = token
         self.recipient = ""                           # Имя собеседника
+        self.current_chat_id = 0
+        self.is_group = False
         self.convs = defaultdict(list)                # История переписок: получатель → список сообщений
 
         # Настройка окна
@@ -31,6 +34,9 @@ class ChatWindow(QWidget):
         self.newChatBtn = QPushButton("Новый чат")
         self.newChatBtn.setObjectName("sendBtn")
         self.newChatBtn.clicked.connect(self.open_new_chat)
+        self.newGroupBtn = QPushButton("Новая группа")
+        self.newGroupBtn.setObjectName("sendBtn")
+        self.newGroupBtn.clicked.connect(self.open_new_group)
 
         self.chatModel = ChatListModel(self)
         self.chatListView = QListView()
@@ -47,6 +53,7 @@ class ChatWindow(QWidget):
         leftLay = QVBoxLayout(leftBox)
         leftLay.setContentsMargins(0, 0, 0, 0)
         leftLay.addWidget(self.newChatBtn)
+        leftLay.addWidget(self.newGroupBtn)
         leftLay.addWidget(self.chatListView, 1)
 
         # Список сообщений справа
@@ -101,35 +108,53 @@ class ChatWindow(QWidget):
             # после успешного создания чат-лист придёт по WS push
             pass
 
+    def open_new_group(self):
+        dlg = NewGroupDialog(self.token, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            # после успешного создания на сервере всем придёт обновлённый список чатов
+            pass
+
     # Вызывается при выборе пользователя в списке.
     # Обновляет заголовок чата, активирует поле ввода и загружает историю переписки.
     def on_chat_selected(self, index):
-        """Обработка клика по диалогу в списке"""
-        username = self.chatModel.data(index, ChatListModel.UsernameRole)
-        self.recipient = username
-        display  = self.chatModel.data(index, ChatListModel.DisplayRole)
+        cid = self.chatModel.data(index, ChatListModel.ChatIDRole)
+        is_grp = self.chatModel.data(index, ChatListModel.IsGroupRole)
+        self.current_chat_id = cid
+        self.is_group = bool(is_grp)
+
+        if self.is_group:
+            self.recipient = None
+        else:
+            self.recipient = self.chatModel.data(index, ChatListModel.UsernameRole)
+
+        display = self.chatModel.data(index, ChatListModel.DisplayRole)
         self.chatLabel.setText(display)
         self.sendBtn.setEnabled(True)
         self.reload_chat_view()
 
     # Отправляет сообщение выбранному собеседнику через WebSocket
     def send(self):
-        # Получаем текст из поля ввода
         txt = self.input.text().strip()
-
-        # Если сообщение пустое или не выбран получатель — выходим
-        if not txt or not self.recipient:
+        if not txt:
             return
 
-        # Формируем словарь-пакет с типом "msg" и основными полями
-        self.ws_bridge.send({
-            "type": "msg",
-            "from": self.username,
-            "to": self.recipient,
-            "text": txt
-        })
+        if self.is_group:
+            payload = {
+                "type": "msg",
+                "chat_id": self.current_chat_id,
+                "text": txt,
+            }
+        else:
+            if not self.recipient:
+                return
+            payload = {
+                "type": "msg",
+                "from": self.username,
+                "to": self.recipient,
+                "text": txt,
+            }
 
-        # Очищаем поле ввода после отправки
+        self.ws_bridge.send(payload)
         self.input.clear()
 
     # Обработка входящих/исходящих пакетов
@@ -137,57 +162,87 @@ class ChatWindow(QWidget):
         ptype = pkt.get("type") # Определяем тип пакета
 
         if ptype == "history":
-            chat_id = pkt.get("chat_id")  # безопаснее через .get
-            # Берём список сообщений, или пустой список, если его нет
+            # всегда приходит chat_id и messages
+            chat_id = pkt.get("chat_id", 0)
             messages = pkt.get("messages") or []
-            last_peer = None
+
+            # 1) сбрасываем накопленные сообщения для этого чата
+            self.convs[chat_id] = []
+
+            # 2) наполняем из пришедшего списка
             for row in messages:
-                dt = datetime.fromtimestamp(row.get("ts", 0) / 1000,
-                                            timezone.utc).astimezone()
-                hhmm = dt.strftime("%H:%M")
-                peer = row.get("from") if row.get("from") != self.username else row.get("to")
-                # сохраняем peer последнего сообщения
-                last_peer = peer
-                self.convs[peer].append((row.get("from"), row.get("text"), hhmm))
-            # Перерисовываем только если были сообщения и чат открыт
-            if last_peer and self.recipient == last_peer:
+                ts = row.get("ts", 0) / 1000
+                hhmm = datetime.fromtimestamp(ts, timezone.utc).astimezone().strftime("%H:%M")
+                sender = row.get("from")
+                text = row.get("text", "")
+                self.convs[chat_id].append((sender, text, hhmm))
+
+            # 3) если сейчас открыт именно этот чат — перерисовываем
+            if self.current_chat_id == chat_id:
                 self.reload_chat_view()
             return
 
         # Если это пакет со списком пользователей — обновляем список слева
         if ptype == "chats":
-            raw = pkt.get("chats", [])
-            chats = []
+            raw = pkt.get("chats") or []
+            unique = {}
             for c in raw:
-                chats.append(
-                    ChatSummary(
-                        chat_id = c["chat_id"],
-                        username = c["username"],
-                        display = c["display"],
-                        last_msg = c["last_msg"],
-                        last_at = c["last_at"],
-                    )
+                cid = c.get("chat_id", 0)
+                if cid in unique:
+                    continue  # пропускаем дубли
+                is_grp = c.get("is_group", False)
+                last_at = c.get("last_at", 0)
+                last_msg = c.get("last_msg", "")
+                if is_grp:
+                    user = ""  # в группах нет peer-username
+                    disp = c.get("title", "")
+                else:
+                    user = c.get("username", "")
+                    disp = c.get("display", "")
+                summary = ChatSummary(
+                    chat_id=cid,
+                    username=user,
+                    display=disp,
+                    last_msg=last_msg,
+                    last_at=last_at,
+                    is_group=is_grp,
                 )
-            # сортировка по последнему сообщению (DESC)
+                unique[cid] = summary
+
+            chats = list(unique.values())
             chats.sort(key=lambda x: x.last_at, reverse=True)
             self.chatModel.update_chats(chats)
             return
 
         # Если это сообщение — добавляем его в переписку
         if ptype == "msg":
-            # берём серверный ts → переводим в локальное HH:MM
+            # время
             ts_ms = pkt.get("ts", int(time.time() * 1000))
-            dt = datetime.fromtimestamp(ts_ms / 1000, timezone.utc).astimezone()
-            time_now = dt.strftime("%H:%M") # Текущее время для отображения
+            hhmm = datetime.fromtimestamp(ts_ms / 1000, timezone.utc) \
+                .astimezone().strftime("%H:%M")
 
-            # Определяем, с кем переписка (если мы получатель, то peer = отправитель, и наоборот)
-            peer = pkt["from"] if pkt["from"] != self.username else pkt["to"]
-            # Добавляем сообщение в историю переписки с этим пользователем
-            self.convs[peer].append((pkt["from"], pkt["text"], time_now))
+            # сначала пробуем взять chat_id из пакета (групповые сообщения)
+            cid = pkt.get("chat_id", 0)
+            if cid == 0:
+                # личное сообщение — вычисляем peer
+                peer = pkt.get("from") if pkt.get("from") != self.username else pkt.get("to")
+                # ищем chat_id в модели
+                cid = 0
+                for row in range(self.chatModel.rowCount()):
+                    idx = self.chatModel.index(row, 0)
+                    if self.chatModel.data(idx, ChatListModel.UsernameRole) == peer:
+                        cid = self.chatModel.data(idx, ChatListModel.ChatIDRole)
+                        break
+                # если всё-таки не нашли — выходим
+                if cid == 0:
+                    return
 
-            # Если сейчас открыт чат с этим пользователем — сразу отображаем сообщение
-            if peer == self.recipient:
-                self.add_bubble(pkt["from"], pkt["text"], time_now)
+            # сохраняем сообщение всегда по cid
+            self.convs[cid].append((pkt.get("from"), pkt.get("text"), hhmm))
+            # показываем в UI, если открыт именно этот чат
+            if self.current_chat_id == cid:
+                self.add_bubble(pkt.get("from"), pkt.get("text"), hhmm)
+            return
 
     # Рендер пузырька в messages-листе
     def add_bubble(self, sender: str, text: str, time_str: str):
@@ -204,9 +259,17 @@ class ChatWindow(QWidget):
         # Автоматическая прокрутка вниз — чтобы было видно новое сообщение
         self.messages.scrollToBottom()
 
+    def add_sender_label(self, display_name: str):
+        """Добавляет над пузырьком label с именем отправителя."""
+        item = QListWidgetItem()
+        label = QLabel(display_name)
+        label.setStyleSheet("font-weight:bold; margin-left:8px;")
+        self.messages.addItem(item)
+        self.messages.setItemWidget(item, label)
+
     # Загружает переписку с выбранным пользователем
     def reload_chat_view(self):
-        self.messages.clear()   # Очищаем текущее окно чата
-        # Для каждого сообщения в истории текущего собеседника
-        for frm, txt, tm in self.convs[self.recipient]:
-            self.add_bubble(frm, txt, tm)   # Добавляем пузырёк в интерфейс
+        self.messages.clear()
+        msgs = self.convs.get(self.current_chat_id, [])
+        for frm, txt, tm in msgs:
+            self.add_bubble(frm, txt, tm)

@@ -6,6 +6,7 @@ SIGNUP_URL = f"{API_BASE}/signup"
 LOGIN_URL  = f"{API_BASE}/login"
 USER_SEARCH_URL = f"{API_BASE}/users/search"
 CHAT_CREATE_URL = f"{API_BASE}/chats/direct"
+GROUP_CREATE_URL = f"{API_BASE}/chats/group"
 
 # Стилизация пастельно-зелёной темой
 PASTEL_QSS = """
