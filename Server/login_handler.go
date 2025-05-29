@@ -3,25 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"     // Для генерации уникальных идентификаторов (токенов)
 	"golang.org/x/crypto/bcrypt" // Для безопасного хэширования и проверки паролей
 )
-
-// loginReq — структура, описывающая тело запроса при попытке входа.
-// Используется при JSON-декодировании входящих данных от клиента.
-type loginReq struct {
-	Username string `json:"username"` // Имя пользователя (логин)
-	Password string `json:"password"` // Пароль (в открытом виде)
-}
-
-// loginResp — структура ответа, отправляемого клиенту при успешной авторизации.
-type loginResp struct {
-	Token    string `json:"token"`    // Уникальный токен сессии
-	Username string `json:"username"` // Имя пользователя
-}
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	/**
@@ -77,4 +66,44 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		Token:    token,
 		Username: req.Username,
 	})
+}
+
+func authUsername(r *http.Request) (string, error) {
+	/**
+	Проверяет заголовок авторизации и возвращает username, если токен валиден.
+
+	Формат заголовка: Authorization: Bearer <token>
+	Возвращает: имя пользователя или ошибку.
+	*/
+
+	// Извлекаем заголовок Authorization из HTTP-запроса
+	h := r.Header.Get("Authorization")
+
+	// Разделяем заголовок по пробелам: ожидаем два слова → "Bearer" и сам токен
+	parts := strings.Fields(h)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		// Формат неверный
+		return "", fmt.Errorf("invalid auth header")
+	}
+
+	// parts[1] — это сам токен
+	var user string
+
+	// Получаем имя пользователя (u.username)
+	// по токену, если он существует и ещё не истёк.
+	err := Pool.QueryRow(context.Background(),
+		`SELECT u.username
+           FROM sessions s
+           JOIN users u ON u.id = s.user_id
+          WHERE s.token=$1 AND s.expires_at > NOW()`,
+		parts[1],
+	).Scan(&user)
+
+	if err != nil {
+		// Токен не найден или просрочен
+		return "", err
+	}
+
+	// Возвращаем имя пользователя, соответствующее токену
+	return user, nil
 }

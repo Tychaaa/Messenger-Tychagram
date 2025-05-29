@@ -5,48 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 )
-
-func authUsername(r *http.Request) (string, error) {
-	/**
-	Проверяет заголовок авторизации и возвращает username, если токен валиден.
-
-	Формат заголовка: Authorization: Bearer <token>
-	Возвращает: имя пользователя или ошибку.
-	*/
-
-	// Извлекаем заголовок Authorization из HTTP-запроса
-	h := r.Header.Get("Authorization")
-
-	// Разделяем заголовок по пробелам: ожидаем два слова → "Bearer" и сам токен
-	parts := strings.Fields(h)
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		// Формат неверный
-		return "", fmt.Errorf("invalid auth header")
-	}
-
-	// parts[1] — это сам токен
-	var user string
-
-	// Получаем имя пользователя (u.username)
-	// по токену, если он существует и ещё не истёк.
-	err := Pool.QueryRow(context.Background(),
-		`SELECT u.username
-           FROM sessions s
-           JOIN users u ON u.id = s.user_id
-          WHERE s.token=$1 AND s.expires_at > NOW()`,
-		parts[1],
-	).Scan(&user)
-
-	if err != nil {
-		// Токен не найден или просрочен
-		return "", err
-	}
-
-	// Возвращаем имя пользователя, соответствующее токену
-	return user, nil
-}
 
 func searchUsersHandler(w http.ResponseWriter, r *http.Request) {
 	/**
@@ -155,13 +114,6 @@ func createDirectChatHandler(w http.ResponseWriter, r *http.Request) {
 		sendChats(req.Username, c) // получателю
 	}
 	mu.Unlock()
-}
-
-// createGroupReq — структура запроса для создания группового чата.
-// Используется при JSON-декодировании тела POST-запроса на /chats/group.
-type createGroupReq struct {
-	Title     string   `json:"title"`     // Название группы (обязательное поле)
-	Usernames []string `json:"usernames"` // Список участников (username'ы), которых нужно добавить в чат
 }
 
 func createGroupChatHandler(w http.ResponseWriter, r *http.Request) {

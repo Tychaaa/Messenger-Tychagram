@@ -10,20 +10,6 @@ import (
 	"golang.org/x/crypto/bcrypt" // Для безопасного хэширования и проверки паролей
 )
 
-// signReq — структура, описывающая JSON-запрос для регистрации пользователя
-type signReq struct {
-	Username  string `json:"username"`            // Уникальное имя пользователя (логин)
-	FirstName string `json:"first_name"`          // Имя (обязательное)
-	LastName  string `json:"last_name,omitempty"` // Фамилия (необязательная)
-	Password  string `json:"password"`            // Пароль (в открытом виде)
-}
-
-// signResp — структура JSON-ответа, который сервер отправляет при успешной регистрации
-type signResp struct {
-	Token    string `json:"token"`    // Сгенерированный токен сессии
-	Username string `json:"username"` // Имя пользователя, под которым зарегистрировались
-}
-
 func signupHandler(w http.ResponseWriter, r *http.Request) {
 	/**
 	Обработчик регистрации нового пользователя.
